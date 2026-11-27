@@ -1,0 +1,127 @@
+name: tts
+
+# Cómputo público de Multiagent Core. Los datos (voz, guiones, audios) viven en el
+# repositorio privado y se leen/escriben con COMPUTE_TOKEN; los logs solo muestran
+# números de frase y puntajes, nunca textos ni audio.
+
+on:
+  workflow_dispatch:
+    inputs:
+      beats:
+        description: Ruta del JSON de frases en el repositorio privado
+        required: true
+        type: string
+      name:
+        description: Carpeta de salida en la rama media del repositorio privado
+        required: true
+        type: string
+      shards:
+        description: Máquinas en paralelo
+        type: number
+        default: 12
+
+concurrency:
+  group: tts-${{ inputs.name }}
+  cancel-in-progress: false
+
+env:
+  PRIVATE_REPO: ernestosgalloni-hash/multiagent-core
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.p.outputs.shards }}
+      total: ${{ steps.p.outputs.total }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.COMPUTE_TOKEN }}
+          path: private
+          sparse-checkout: jobs
+      - id: p
+        run: |
+          n=$(jq length "private/${{ inputs.beats }}")
+          s=${{ inputs.shards }}; [ "$s" -gt "$n" ] && s=$n; [ "$s" -gt 20 ] && s=20
+          echo "total=$s" >> "$GITHUB_OUTPUT"
+          echo "shards=$(jq -c -n "[range(0;$s)]")" >> "$GITHUB_OUTPUT"
+          echo "$n frases en $s máquinas"
+
+  narrate:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(needs.plan.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.COMPUTE_TOKEN }}
+          path: private
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: private/tools/tts/requirements.txt
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-qwen-0.6b-whisper-v1
+      - name: Instalar
+        run: |
+          command -v ffmpeg >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg >/dev/null; }
+          pip install -q -r private/tools/tts/requirements.txt
+      - name: Narrar
+        working-directory: private
+        env:
+          QUIET: "1"
+        run: python tools/tts/beats.py "${{ inputs.beats }}" ${{ matrix.shard }} ${{ needs.plan.outputs.total }} /tmp/out
+      - name: Entregar al repositorio privado
+        working-directory: private
+        run: |
+          branch="work/${{ inputs.name }}-${{ matrix.shard }}"
+          git config user.name "multiagent-compute"; git config user.email "actions@users.noreply.github.com"
+          git checkout -q --orphan "$branch" && git rm -rq --cached . >/dev/null && git clean -fdq
+          cp /tmp/out/*.wav . && git add *.wav && git commit -q -m "frases ${{ matrix.shard }}"
+          git push -q -f origin "$branch"
+
+  assemble:
+    needs: [plan, narrate]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.COMPUTE_TOKEN }}
+          path: private
+          fetch-depth: 1
+      - name: Unir y publicar
+        working-directory: private
+        run: |
+          command -v ffmpeg >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg >/dev/null; }
+          beats="${{ inputs.beats }}"; name="${{ inputs.name }}"
+          mkdir -p /tmp/beats /tmp/pub
+          for s in $(seq 0 $(( ${{ needs.plan.outputs.total }} - 1 ))); do
+            git fetch -q --depth 1 origin "work/$name-$s" && git --work-tree=/tmp/beats checkout FETCH_HEAD -- . 2>/dev/null || echo "::warning::falta la máquina $s"
+          done
+          ffmpeg -loglevel error -f lavfi -t 0.4 -i anullsrc=r=24000:cl=mono -c:a pcm_s16le /tmp/pause.wav
+          trim="silenceremove=start_periods=1:start_threshold=-50dB:start_silence=0.08,areverse,silenceremove=start_periods=1:start_threshold=-50dB:start_silence=0.15,areverse"
+          : > /tmp/list.txt
+          for id in $(jq -r '.[].id' "$beats"); do
+            [ -f "/tmp/beats/$id.wav" ] || { echo "::warning::falta $id"; continue; }
+            ffmpeg -loglevel error -y -i "/tmp/beats/$id.wav" -af "$trim" -ar 24000 -ac 1 "/tmp/t-$id.wav"
+            ffmpeg -loglevel error -y -i "/tmp/t-$id.wav" -af loudnorm=I=-16 -b:a 160k "/tmp/pub/$id.mp3"
+            echo "file '/tmp/t-$id.wav'" >> /tmp/list.txt; echo "file '/tmp/pause.wav'" >> /tmp/list.txt
+          done
+          ffmpeg -loglevel error -y -f concat -safe 0 -i /tmp/list.txt -af loudnorm=I=-16 -b:a 160k /tmp/pub/completo.mp3
+          git config user.name "multiagent-compute"; git config user.email "actions@users.noreply.github.com"
+          git fetch -q --depth 1 origin media && git checkout -q -B media FETCH_HEAD
+          mkdir -p "audio/$name" && cp /tmp/pub/* "audio/$name/"
+          git add "audio/$name" && git commit -q -m "narración $name (cómputo público)" && git push -q origin media
+          for s in $(seq 0 $(( ${{ needs.plan.outputs.total }} - 1 ))); do git push -q origin --delete "work/$name-$s" || true; done
+          echo "publicado: $(ls /tmp/pub | wc -l) archivos"
